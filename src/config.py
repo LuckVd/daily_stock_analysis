@@ -31,12 +31,17 @@ from src.notification_noise import (
     parse_notification_quiet_hours,
     validate_notification_timezone,
 )
+from src.notification_contracts import (
+    is_feishu_app_bot_configured,
+    is_feishu_static_configured,
+)
 from src.llm import generation_params as llm_generation_params
+from src.scheduler import normalize_schedule_times
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ALPHASIFT_INSTALL_SPEC = (
-    "git+https://github.com/ZhuLinsen/alphasift.git@b2ca66dd47001b9a09890cfe21c2b18c7219ccf5"
+    "git+https://github.com/ZhuLinsen/alphasift.git@377049857cc04175dc3cca62121ee41adec6cdb8"
 )
 
 
@@ -711,6 +716,10 @@ class Config:
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3   # 新闻最大时效（天）
     news_strategy_profile: str = "short"  # 新闻窗口策略档位：ultra_short/short/medium/long
+    news_intel_retention_days: int = 30  # 本地资讯池保留天数
+    news_intel_fetch_timeout_sec: float = 8.0  # 单个资讯源拉取超时
+    news_intel_max_items_per_source: int = 50  # 单次每个资讯源最多采集条数
+    newsnow_base_url: str = "https://newsnow.busiyi.world"  # NewsNow HTTP API base URL (数据源侧，不影响 LLM/provider base URL)
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
     # === Agent 模式配置 ===
@@ -747,6 +756,11 @@ class Config:
     feishu_webhook_url: Optional[str] = None
     feishu_webhook_secret: Optional[str] = None  # 自定义机器人签名密钥（可选）
     feishu_webhook_keyword: Optional[str] = None  # 自定义机器人关键词（可选）
+
+    # 飞书应用机器人（App Bot）通知
+    feishu_chat_id: Optional[str] = None  # 目标群会话 chat_id（群聊模式），或用户 open_id（P2P 模式）
+    feishu_receive_id_type: str = "chat_id"  # 接收者 ID 类型: "chat_id"(群聊) / "open_id"(私聊)
+    feishu_domain: str = "feishu"  # 飞书域名: "feishu"(feishu.cn) / "lark"(larksuite.com)
     
     # Telegram 配置（需要同时配置 Bot Token 和 Chat ID）
     telegram_bot_token: Optional[str] = None  # Bot Token（@BotFather 获取）
@@ -885,9 +899,11 @@ class Config:
     # === 定时任务配置 ===
     schedule_enabled: bool = False            # 是否启用定时任务
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
+    schedule_times: List[str] = field(default_factory=lambda: ["18:00"])
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
+    daily_market_context_enabled: bool = True   # 是否将大盘环境摘要用于个股分析 Prompt 与保守护栏
     # 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、both(三市场)，us 适合仅关注美股的用户
     market_review_region: str = "cn"
     market_review_color_scheme: str = "green_up"
@@ -999,6 +1015,7 @@ class Config:
             "RUN_IMMEDIATELY",
             "SCHEDULE_ENABLED",
             "SCHEDULE_TIME",
+            "SCHEDULE_TIMES",
             "SCHEDULE_RUN_IMMEDIATELY",
         }
     )
@@ -1408,6 +1425,11 @@ class Config:
             default='18:00',
             prefer_env_file=True,
         )
+        schedule_times_value = cls._resolve_env_value(
+            'SCHEDULE_TIMES',
+            default='',
+            prefer_env_file=True,
+        )
 
         report_language_raw = cls._resolve_report_language_env_value(
             preexisting_report_language
@@ -1489,6 +1511,28 @@ class Config:
             news_strategy_profile=cls._parse_news_strategy_profile(
                 os.getenv('NEWS_STRATEGY_PROFILE', 'short')
             ),
+            news_intel_retention_days=parse_env_int(
+                os.getenv('NEWS_INTEL_RETENTION_DAYS'),
+                30,
+                field_name='NEWS_INTEL_RETENTION_DAYS',
+                minimum=1,
+                maximum=365,
+            ),
+            news_intel_fetch_timeout_sec=parse_env_float(
+                os.getenv('NEWS_INTEL_FETCH_TIMEOUT_SEC'),
+                8.0,
+                field_name='NEWS_INTEL_FETCH_TIMEOUT_SEC',
+                minimum=1.0,
+                maximum=30.0,
+            ),
+            news_intel_max_items_per_source=parse_env_int(
+                os.getenv('NEWS_INTEL_MAX_ITEMS_PER_SOURCE'),
+                50,
+                field_name='NEWS_INTEL_MAX_ITEMS_PER_SOURCE',
+                minimum=1,
+                maximum=200,
+            ),
+            newsnow_base_url=((os.getenv('NEWSNOW_BASE_URL') or '').strip().rstrip('/') or 'https://newsnow.busiyi.world'),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
             agent_litellm_model=agent_litellm_model,
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
@@ -1551,6 +1595,10 @@ class Config:
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             feishu_webhook_secret=os.getenv('FEISHU_WEBHOOK_SECRET'),
             feishu_webhook_keyword=os.getenv('FEISHU_WEBHOOK_KEYWORD'),
+
+            feishu_chat_id=os.getenv('FEISHU_CHAT_ID'),
+            feishu_receive_id_type=os.getenv('FEISHU_RECEIVE_ID_TYPE', 'chat_id'),
+            feishu_domain=os.getenv('FEISHU_DOMAIN', 'feishu'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
             telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
             telegram_message_thread_id=os.getenv('TELEGRAM_MESSAGE_THREAD_ID'),
@@ -1685,9 +1733,14 @@ class Config:
                 prefer_env_file=True,
             ).lower() == 'true',
             schedule_time=(schedule_time_value or '18:00').strip() or '18:00',
+            schedule_times=normalize_schedule_times(
+                schedule_times_value,
+                fallback_time=(schedule_time_value or '18:00').strip() or '18:00',
+            ),
             schedule_run_immediately=schedule_run_immediately,
             run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
+            daily_market_context_enabled=os.getenv('DAILY_MARKET_CONTEXT_ENABLED', 'true').lower() == 'true',
             market_review_region=cls._parse_market_review_region(
                 os.getenv('MARKET_REVIEW_REGION', 'cn')
             ),
@@ -1953,7 +2006,12 @@ class Config:
 
     @classmethod
     def _channels_to_model_list(cls, channels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Convert parsed LLM channels to LiteLLM Router model_list format."""
+        """Convert parsed LLM channels to LiteLLM Router model_list format.
+
+        Mapping follows:
+        - LiteLLM providers: https://docs.litellm.ai/docs/providers
+        - LiteLLM model_list 语义: https://docs.litellm.ai/docs/proxy/configs#the-model_list-key
+        """
         model_list: List[Dict[str, Any]] = []
         for ch in channels:
             for model_name in ch['models']:
@@ -1993,6 +2051,11 @@ class Config:
         deployments, keyed by placeholder model_name tokens.  The analyzer
         resolves actual model_names at call time from LITELLM_MODEL /
         LITELLM_FALLBACK_MODELS.
+
+        Compatibility note:
+        - LiteLLM OpenAI-compatible 约定: https://docs.litellm.ai/docs/providers/openai_compatible
+        - OpenAI 请求与鉴权约定: https://platform.openai.com/docs/api-reference/making-requests
+          / https://platform.openai.com/docs/api-reference/authentication
         """
         model_list: List[Dict[str, Any]] = []
 
@@ -2596,6 +2659,11 @@ class Config:
         has_notification = bool(
             self.wechat_webhook_url
             or self.feishu_webhook_url
+            or (
+                (self.feishu_app_id or "")
+                and (self.feishu_app_secret or "")
+                and (self.feishu_chat_id or "")
+            )
             or (self.telegram_bot_token and self.telegram_chat_id)
             or (self.email_sender and self.email_password)
             or (self.pushover_user_key and self.pushover_api_token)
@@ -2732,27 +2800,35 @@ class Config:
 
         has_feishu_app_id = bool((self.feishu_app_id or "").strip())
         has_feishu_app_secret = bool((self.feishu_app_secret or "").strip())
+        has_feishu_app_credentials_complete = has_feishu_app_id and has_feishu_app_secret
         has_feishu_app_credentials = has_feishu_app_id or has_feishu_app_secret
         has_feishu_doc_token = bool((self.feishu_folder_token or "").strip())
         has_feishu_full_cloud_doc_credentials = (
-            has_feishu_app_id
-            and has_feishu_app_secret
+            has_feishu_app_credentials_complete
             and has_feishu_doc_token
         )
+        has_feishu_stream_route = bool(self.feishu_stream_enabled and has_feishu_app_credentials_complete)
+        has_feishu_app_notification_route = is_feishu_app_bot_configured(self)
         if (
             has_feishu_app_credentials
             and not has_feishu_full_cloud_doc_credentials
-            and not self.feishu_webhook_url
-            and not (self.feishu_stream_enabled and has_feishu_app_id and has_feishu_app_secret)
+            and not is_feishu_static_configured(self)
+            and not has_feishu_stream_route
+            and not has_feishu_app_notification_route
         ):
+            suggestions = []
+            if has_feishu_app_credentials_complete:
+                suggestions.append("配置 FEISHU_CHAT_ID 开启 App Bot 主动推送")
+                suggestions.append("开启 FEISHU_STREAM_ENABLED 使用应用机器人事件订阅")
+            else:
+                suggestions.append("补齐 FEISHU_APP_ID / FEISHU_APP_SECRET 后配置 FEISHU_CHAT_ID 开启 App Bot 主动推送")
+            suggestions.append("配置 FEISHU_WEBHOOK_URL 使用自定义机器人 Webhook 推送")
             issues.append(ConfigIssue(
                 severity="warning",
-                message=(
-                    "仅配置 FEISHU_APP_ID / FEISHU_APP_SECRET 不会开启飞书群 Webhook 推送；"
-                    "如需群消息通知，请配置 FEISHU_WEBHOOK_URL。若要使用应用机器人，请同时开启 "
-                    "FEISHU_STREAM_ENABLED 并完成应用发布与权限配置。"
-                ),
-                field="FEISHU_WEBHOOK_URL",
+                message="仅配置 FEISHU_APP_ID / FEISHU_APP_SECRET 不会开启飞书静态通知。"
+                        + " 请选择以下方式之一："
+                        + "；".join(suggestions) + "。",
+                field="FEISHU_CHAT_ID",
             ))
 
         # --- Deprecated field migration hints ---
